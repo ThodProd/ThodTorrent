@@ -1,7 +1,8 @@
-param([string]$HubRoot='D:\Projects\ThodPROD')
+﻿param([string]$HubRoot='D:\Projects\ThodPROD',[string]$Notes='Новый интерфейс: разделы и счётчики, поиск, статусы, светлая и тёмная темы, аккуратная таблица и диалоги.')
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 $stage=Join-Path $root 'stage'
+if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Recurse -Force}
 New-Item -ItemType Directory -Path (Join-Path $stage 'app') -Force | Out-Null
 Copy-Item (Join-Path $root 'target/release/thodtorrent.exe') (Join-Path $stage 'app/thodtorrent.exe')
 Copy-Item (Join-Path $root 'target/release/libunwind.dll') (Join-Path $stage 'app/libunwind.dll')
@@ -17,4 +18,4 @@ foreach($crate in Get-ChildItem $registry -Directory){
 }
 Copy-Item (Join-Path $root 'assets/librqbit-LICENSE') $licenses
 Copy-Item (Join-Path $HubRoot '.tools/llvm/llvm-mingw-20260616-ucrt-x86_64/LICENSE.TXT') (Join-Path $licenses 'llvm-mingw-LICENSE.txt')
-& (Join-Path $HubRoot 'scripts/package-module.ps1') -PackageDirectory $stage -Repository 'ThodProd/ThodTorrent' -OutputDirectory (Join-Path $root 'dist') -Notes 'Первый выпуск: magnet и .torrent, выбор папки, настраиваемые столбцы, контекстное меню, остановка после загрузки и отключённая отдача.'
+& (Join-Path $HubRoot 'scripts/package-module.ps1') -PackageDirectory $stage -Repository 'ThodProd/ThodTorrent' -OutputDirectory (Join-Path $root 'dist') -Notes $Notes

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod integration;
 mod selftest;
+mod ui;
 
 fn data_dir() -> PathBuf {
     std::env::var_os("THODHUB_DATA_DIR").map(PathBuf::from).or_else(|| winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).open_subkey("Software\\ThodTorrent").ok().and_then(|k|k.get_value::<String,_>("DataDir").ok()).map(PathBuf::from)).unwrap_or_else(|| PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("ThodHUB/Data/thodtorrent"))
@@ -14,7 +15,7 @@ fn data_dir() -> PathBuf {
 struct Settings { folder: String, columns: Vec<bool>, dark: bool }
 const COLUMNS:[&str;13]=["Имя","Прогресс","Размер","Скачано","Скачивание","Отдача","Осталось","Состояние","Папка","Отдано","Рейтинг","Частей","Хеш"];
 impl Default for Settings {
-    fn default() -> Self { Self { folder: PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("Downloads").display().to_string(), columns: (0..13).map(|i|i<8).collect(), dark: false } }
+    fn default() -> Self { Self { folder: PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("Downloads").display().to_string(), columns: COLUMNS.iter().enumerate().map(|(i,_)| matches!(i,0|1|2|3|4|6)).collect(), dark: false } }
 }
 fn main() {if let Err(e)=run(){eprintln!("{e:#}");if !std::env::args().any(|a|a.starts_with("--")){rfd::MessageDialog::new().set_title("ThodTorrent — ошибка").set_description(format!("{e:#}")).set_level(rfd::MessageLevel::Error).show();}std::process::exit(1);}}
 fn run() -> anyhow::Result<()> {
@@ -42,7 +43,13 @@ fn run() -> anyhow::Result<()> {
     let icon=image::load_from_memory(include_bytes!("../assets/app.ico"))?.into_rgba8();
     let _=std::fs::remove_file(data_dir().join("runtime/stop"));
     let icon=egui::IconData{width:icon.width(),height:icon.height(),rgba:icon.into_raw()};
-    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_icon(icon).with_inner_size([1100., 650.]).with_min_inner_size([720.,560.]), ..Default::default() };
+    let inner_size = if std::env::var("THODTORRENT_RENDER_CHECK").is_ok() {
+        std::env::var("THODTORRENT_RENDER_SIZE").ok().and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some([w.trim().parse().ok()?, h.trim().parse().ok()?])
+        }).unwrap_or([1160., 720.])
+    } else { [1160., 720.] };
+    let options = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_icon(icon).with_inner_size(inner_size).with_min_inner_size([780., 580.]), ..Default::default() };
     let result=eframe::run_native("ThodTorrent", options, Box::new(move |cc| Ok(Box::new(App::new(cc, target))))).map_err(|e| anyhow::anyhow!("{e}"));
     drop(lock);result
 }
@@ -99,6 +106,9 @@ struct App {
     settings: Settings, source: String, folder: String, adding: bool,
     rows: Vec<Value>, error: String, selected: Option<u64>, confirm: Option<u64>,
     details: Option<Value>, notice: String,
+    filter: usize, search: String, preferences: bool, remember_folder: bool,
+    preview_frames: u32, focus_source: bool, focus_search: bool,
+    icon_tex: egui::TextureHandle,
     child: std::process::Child, input: Option<std::process::ChildStdin>, rx: mpsc::Receiver<Value>,
 }
 impl App {
@@ -106,83 +116,36 @@ impl App {
         let mut settings: Settings = std::fs::read(data_dir().join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         settings.columns.resize(COLUMNS.len(),false);settings.columns[0]=true;
         let mut fonts = egui::FontDefinitions::default();
-        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/segoeui.ttf") { fonts.font_data.insert("Segoe".into(), egui::FontData::from_owned(bytes).into()); fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0,"Segoe".into()); }
+        let mut regular = false;
+        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/segoeui.ttf") {
+            fonts.font_data.insert("Segoe".into(), egui::FontData::from_owned(bytes).into());
+            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0,"Segoe".into());
+            regular = true;
+        }
+        let bold_name = if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/segoeuib.ttf") {
+            fonts.font_data.insert("Segoe-Bold".into(), egui::FontData::from_owned(bytes).into());
+            "Segoe-Bold"
+        } else { "Segoe" };
+        if regular {
+            fonts.families.insert(egui::FontFamily::Name("Bold".into()), vec![bold_name.to_owned(), "Segoe".into()]);
+        } else {
+            let fallback = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+            fonts.families.insert(egui::FontFamily::Name("Bold".into()), fallback);
+        }
         cc.egui_ctx.set_fonts(fonts);
+        let icon = image::load_from_memory(include_bytes!("../assets/app.ico")).expect("Иконка приложения повреждена").into_rgba8();
+        let color = egui::ColorImage::from_rgba_unmultiplied([icon.width() as usize, icon.height() as usize], icon.as_raw());
+        let icon_tex = cc.egui_ctx.load_texture("app-icon", color, egui::TextureOptions::LINEAR);
         let _=std::fs::create_dir_all(data_dir().join("logs"));
         let log=std::fs::File::create(data_dir().join("logs/worker.log")).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap()).arg("--worker").creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(log)).spawn().expect("Не удалось запустить движок");
         let input = child.stdin.take(); let output = child.stdout.take().unwrap(); let (tx,rx) = mpsc::channel();
         std::thread::spawn(move || { for line in std::io::BufReader::new(output).lines().map_while(Result::ok) { if let Ok(v) = serde_json::from_str(&line) { if tx.send(v).is_err() { break; } } } });
-        Self { folder: settings.folder.clone(), settings, adding: !target.is_empty(), source: target, rows:vec![], error:String::new(), selected:None, confirm:None, details:None, notice:String::new(), child,input,rx }
+        let adding = !target.is_empty();
+        Self { folder: settings.folder.clone(), settings, adding, source: target, rows:vec![], error:String::new(), selected:None, confirm:None, details:None, notice:String::new(), filter:0,search:String::new(),preferences:false,remember_folder:false,preview_frames:0,focus_source:adding,focus_search:false,icon_tex,child,input,rx }
     }
     fn send(&mut self, value: Value) { if let Some(input) = &mut self.input { if let Err(e) = writeln!(input,"{value}").and_then(|_| input.flush()) { self.error = format!("Движок недоступен: {e}"); } } }
     fn save(&mut self) { if let Err(e) = std::fs::write(data_dir().join("settings.json"), serde_json::to_vec_pretty(&self.settings).unwrap()) { self.error = format!("Не удалось сохранить настройки: {e}"); } }
 }
-fn size(v:f64) -> String { if v >= 1073741824. { format!("{:.2} ГБ",v/1073741824.) } else if v >=1048576. { format!("{:.1} МБ",v/1048576.) } else { format!("{:.1} КБ",v/1024.) } }
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        if data_dir().join("runtime/stop").exists(){ctx.send_viewport_cmd(egui::ViewportCommand::Close);}
-        if let Ok(Some(code))=self.child.try_wait(){self.error=format!("Движок завершился ({code}). Перезапустите приложение. Журнал: {}",data_dir().join("logs/worker.log").display());}
-        if ctx.input(|i|i.key_pressed(egui::Key::Escape)){self.adding=false;self.confirm=None;}
-        if let Ok(files)=std::fs::read_dir(data_dir().join("runtime/inbox")){ for entry in files.flatten(){if let Ok(bytes)=std::fs::read(entry.path()){if let Ok(target)=serde_json::from_slice::<String>(&bytes){if !self.adding {self.source=target;self.adding=!self.source.is_empty();ctx.send_viewport_cmd(egui::ViewportCommand::Focus);let _=std::fs::remove_file(entry.path());}}}}}
-        while let Ok(v) = self.rx.try_recv() { if let Some(rows) = v["torrents"].as_array() { self.rows=rows.clone(); } if let Some(e) = v["error"].as_str() { self.error=e.into();self.notice.clear(); } if !v["details"].is_null(){self.details=Some(v["details"].clone());} if v["ok"].as_bool()==Some(true){self.notice="Операция выполнена".into();} }
-        let mut visual=if self.settings.dark {egui::Visuals::dark()} else {egui::Visuals::light()};
-        visual.panel_fill=if self.settings.dark{egui::Color32::from_rgb(28,29,32)}else{egui::Color32::WHITE};
-        visual.selection.bg_fill=egui::Color32::from_rgb(54,118,232);ctx.set_visuals(visual);
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("ThodTorrent"); ui.add_space(12.);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Добавить ссылку").clicked() { self.adding=true; }
-                if ui.button("Открыть .torrent").clicked() { if let Some(p)=rfd::FileDialog::new().add_filter("Торрент", &["torrent"]).pick_file() { self.source=p.display().to_string();self.adding=true; } }
-                if ui.button("Продолжить").clicked() { if let Some(id)=self.selected {self.send(json!({"method":"start","id":id}));} }
-                if ui.button("Стоп").clicked() { if let Some(id)=self.selected {self.send(json!({"method":"pause","id":id}));} }
-                ui.menu_button("Столбцы", |ui| { for (i,name) in COLUMNS.iter().enumerate().skip(1) { if ui.checkbox(&mut self.settings.columns[i], *name).changed(){self.save();} } });
-                if ui.checkbox(&mut self.settings.dark,"Тёмная тема").changed(){ self.save(); }
-                if ui.button("По умолчанию").clicked(){match integration::run(false){Ok(())=>{let _=Command::new("explorer.exe").arg("ms-settings:defaultapps").spawn();},Err(e)=>self.error=format!("Регистрация: {e:#}")}}
-            });
-            ui.add_space(10.); ui.label("По завершении — стоп. Отдача отключена."); ui.separator();
-            if !self.notice.is_empty(){ui.label(&self.notice);}
-            let titles=COLUMNS;
-            let rows=self.rows.clone();
-            egui::ScrollArea::both().show(ui,|ui| {
-                egui::Grid::new("torrents").striped(true).min_col_width(85.).spacing([16.,12.]).show(ui, |ui| {
-                    for (i,title) in titles.iter().enumerate() {if self.settings.columns[i] {ui.strong(*title);}} ui.end_row();
-                    for row in rows {
-                        let id=row["id"].as_u64().unwrap_or(0); let s=&row["stats"]; let total=s["total_bytes"].as_f64().unwrap_or(0.); let done=s["progress_bytes"].as_f64().unwrap_or(0.);
-                        for i in 0..COLUMNS.len() { if !self.settings.columns[i] {continue;} match i {
-                            0=> { let response=ui.selectable_label(self.selected==Some(id),row["name"].as_str().unwrap_or("Получение метаданных…")); if response.clicked(){self.selected=Some(id);}
-                                response.context_menu(|ui| { for (label,method) in [("Продолжить","start"),("Остановить","pause"),("Убрать из списка","forget")] {if ui.button(label).clicked(){self.send(json!({"method":method,"id":id}));ui.close_menu();}}
-                                    if ui.button("Сведения и файлы").clicked(){self.send(json!({"method":"details","id":id}));ui.close_menu();}
-                                    if ui.button("Открыть папку").clicked(){let _=Command::new("explorer.exe").arg(row["output_folder"].as_str().unwrap_or("")).spawn();ui.close_menu();}
-                                    if ui.button("Скопировать magnet-ссылку").clicked(){ctx.copy_text(format!("magnet:?xt=urn:btih:{}",row["info_hash"].as_str().unwrap_or("")));ui.close_menu();}
-                                    if ui.button("Удалить вместе с файлами…").clicked(){self.confirm=Some(id);ui.close_menu();}
-                                });
-                            },
-                            1=>{ui.add(egui::ProgressBar::new(if total>0.{(done/total) as f32}else{0.}).show_percentage().desired_width(130.));},
-                            2=>{ui.label(size(total));},3=>{ui.label(size(done));},
-                            4|5=>{let key=if i==4{"download_speed"}else{"upload_speed"}; let speed=s["live"][key]["mbps"].as_f64().unwrap_or(0.);ui.label(format!("{}/с",size(speed*1048576.)));},
-                            6=>{ui.label(s["live"]["time_remaining"]["human_readable"].as_str().unwrap_or("—"));},
-                            7=>{ui.label(if s["finished"].as_bool()==Some(true){"Завершено · стоп"}else{match s["state"].as_str().unwrap_or(""){"live"=>"Скачивание","paused"=>"Остановлено","error"=>"Ошибка",_=>"Проверка"}});},
-                            8=>{ui.label(row["output_folder"].as_str().unwrap_or(""));},
-                            9=>{ui.label(size(s["uploaded_bytes"].as_f64().unwrap_or(0.)));},
-                            10=>{ui.label(format!("{:.2}",if done>0.{s["uploaded_bytes"].as_f64().unwrap_or(0.)/done}else{0.}));},
-                            11=>{ui.label(row["total_pieces"].to_string());},
-                            _=>{ui.label(row["info_hash"].as_str().unwrap_or(""));}
-                        }} ui.end_row();
-                    }
-                });
-            });
-            if !self.error.is_empty() { ui.separator();ui.colored_label(egui::Color32::RED,"Ошибка операции");ui.label(&self.error);if ui.button("Скрыть ошибку").clicked(){self.error.clear();} }
-        });
-        if self.adding { egui::Window::new("Добавить загрузку").collapsible(false).resizable(true).show(ctx,|ui| {
-            ui.label("Magnet, ссылка на .torrent или путь к файлу");ui.text_edit_singleline(&mut self.source);
-            ui.label("Сохранить в папку");ui.horizontal(|ui| {ui.text_edit_singleline(&mut self.folder);if ui.button("Выбрать папку").clicked(){if let Some(p)=rfd::FileDialog::new().pick_folder(){self.folder=p.display().to_string();}}});
-            if ui.button("Запомнить папку по умолчанию").clicked(){self.settings.folder=self.folder.clone();self.save();}
-            ui.horizontal(|ui| {if ui.button("Скачать").clicked() && !self.source.trim().is_empty() && !self.folder.trim().is_empty(){self.send(json!({"method":"add","source":self.source.trim(),"folder":self.folder}));self.notice="Получение метаданных и подготовка загрузки…".into();self.source.clear();self.adding=false;}if ui.button("Отмена").clicked(){self.adding=false;}});
-        }); }
-        if let Some(details)=self.details.clone(){let mut open=true;egui::Window::new("Сведения и файлы").open(&mut open).show(ctx,|ui|{ui.label(details["name"].as_str().unwrap_or("Торрент"));ui.label(details["output_folder"].as_str().unwrap_or(""));egui::ScrollArea::vertical().max_height(350.).show(ui,|ui|{if let Some(files)=details["files"].as_array(){for file in files{ui.label(format!("{} · {}",file["name"].as_str().unwrap_or(""),size(file["length"].as_f64().unwrap_or(0.))));}}});});if !open{self.details=None;}}
-        if let Some(id)=self.confirm { egui::Window::new("Удалить файлы безвозвратно?").collapsible(false).show(ctx,|ui| {ui.label(self.rows.iter().find(|r|r["id"].as_u64()==Some(id)).and_then(|r|r["name"].as_str()).unwrap_or("Торрент"));if ui.button("Удалить торрент и файлы").clicked(){self.send(json!({"method":"delete","id":id}));self.confirm=None;}if ui.button("Отмена").clicked(){self.confirm=None;} }); }
-        ctx.request_repaint_after(Duration::from_millis(250));
-    }
-}
+fn size(v:f64) -> String { let s=if v >= 1073741824. { format!("{:.2} ГБ",v/1073741824.) } else if v >=1048576. { format!("{:.1} МБ",v/1048576.) } else { format!("{:.1} КБ",v/1024.) }; s.replace('.',",") }
 impl Drop for App { fn drop(&mut self) { self.input.take(); for _ in 0..30 { if self.child.try_wait().ok().flatten().is_some(){return;} std::thread::sleep(Duration::from_millis(100)); } let _=self.child.kill();let _=self.child.wait(); } }
